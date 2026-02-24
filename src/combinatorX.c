@@ -825,18 +825,24 @@ static bool load_all_files_to_ram(){
     // Tách dòng
     uint64_t current_line = 0;
     char *start = main_ctx.file_buffer[i];
+
     for (uint64_t j = 0; j < sb.st_size; j++) {
-      if (main_ctx.file_buffer[i][j] == '\n' || main_ctx.file_buffer[i][j] == '\r') {
+      if (main_ctx.file_buffer[i][j] == '\r') {
+        // Biến \r thành chuỗi kết thúc để loại bỏ nó (xử lý file Windows)
+        main_ctx.file_buffer[i][j] = '\0'; 
+      } 
+      else if (main_ctx.file_buffer[i][j] == '\n') {
         main_ctx.file_buffer[i][j] = '\0';
         main_ctx.file_lines[i][current_line] = start;
-        main_ctx.line_lens[i][current_line] = (main_ctx.file_buffer[i] + j) - start;
+        // Dùng strlen sẽ tự động bỏ qua \r nếu file định dạng Windows
+        main_ctx.line_lens[i][current_line] = strlen(start); 
         start = main_ctx.file_buffer[i] + j + 1;
         current_line++;
       }
     }
     if (current_line < lines) {
       main_ctx.file_lines[i][current_line] = start;
-      main_ctx.line_lens[i][current_line] = (main_ctx.file_buffer[i] + sb.st_size) - start;
+      main_ctx.line_lens[i][current_line] = strlen(start);
     }
   }
   return true;
