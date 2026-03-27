@@ -28,8 +28,8 @@
 #include <sys/stat.h>
 #include <sys/mman.h>
 
-#define PROG_VERSION "1.3"
-#define PROG_RELEASE_DATE "Wed Aug 25 19:42:17 CEST 2021"
+#define PROG_VERSION "1.4"
+#define PROG_RELEASE_DATE "Fri Mar 27 16:55:17 ICT 2026"
 
 #define WORD_MAX_LEN  64
 #define SEGMENT_SIZE  (WORD_MAX_LEN * 1024 * 1024)
