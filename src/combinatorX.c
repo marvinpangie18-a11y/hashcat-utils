@@ -8,7 +8,7 @@
  * Enhanced version of unix-ninja 'combinator3'
  * feat. lightweight dolphin macro :P
  */
-
+#pragma GCC diagnostic ignored "-Wreturn-mismatch"
 #define _GNU_SOURCE
 #define _FILE_OFFSET_BITS 64
 #define __MSVCRT_VERSION__ 0x0700
