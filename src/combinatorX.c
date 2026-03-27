@@ -25,8 +25,10 @@
 #include <unistd.h>
 #include <signal.h>
 #include <inttypes.h>
+#include <sys/stat.h>
+#include <sys/mman.h>
 
-#define PROG_VERSION "1.2"
+#define PROG_VERSION "1.3"
 #define PROG_RELEASE_DATE "Wed Aug 25 19:42:17 CEST 2021"
 
 #define WORD_MAX_LEN  64
@@ -66,12 +68,18 @@ typedef struct cx_session
   uint64_t skip, limit, max_skip, max_files;
   uint64_t maxRep;
   uint64_t maxLen;
+  char *file_buffer[8]; //mmap pointer for each file
+  char **file_lines[8]; // pointer to each line in RAM
+  uint64_t *line_lens[8]; // array of length of each line
+  uint64_t total_lines[8]; // total lines in each file
+  uint64_t file_sizes[8]; // size of each file
 
 } cx_session_t;
 
 static char **freeList;
 static int freeListIdx;
 static cx_session_t main_ctx;
+
 
 static uint8_t hex_convert (const uint8_t c)
 {
@@ -472,29 +480,24 @@ static void session_print (void)
 
 static bool session_update (void)
 {
+  if(main_ctx.sfp[0] == NULL) return false;
   rewind (main_ctx.sfp[0]);
+  struct{
+    uint64_t cur_rep[8];
+    uint64_t skip;
+    uint64_t limit;
+    uint64_t maxRep;
+    uint64_t maxLen;
+  } s_data;
+  memcpy(s_data.cur_rep, main_ctx.cur_rep, sizeof(main_ctx.cur_rep));
+  s_data.skip = main_ctx.skip;
+  s_data.limit = main_ctx.limit;
+  s_data.maxRep = main_ctx.maxRep;
+  s_data.maxLen = main_ctx.maxLen;
 
-  #ifdef DEBUG
-  if (debug)
-  {
-    session_print ();
-  }
-  #endif
-
-  fprintf (main_ctx.sfp[0], "%" PRIu64 " %" PRIu64 " %" PRIu64 " %" PRIu64 " %" PRIu64 " %" PRIu64 " %" PRIu64 " %" PRIu64 " %" PRIu64 " %" PRIu64 " %" PRIu64 " %" PRIu64 " %" PRIu64 " %" PRIu64 " %" PRIu64 " %" PRIu64 " %" PRIu64 " %" PRIu64 " %" PRIu64 " %" PRIu64 "",
-           main_ctx.off_fd[0], main_ctx.off_fd[1], main_ctx.off_fd[2], main_ctx.off_fd[3], main_ctx.off_fd[4], main_ctx.off_fd[5], main_ctx.off_fd[6], main_ctx.off_fd[7],
-           main_ctx.skip, main_ctx.limit, main_ctx.maxRep, main_ctx.maxLen,
-           main_ctx.off_vir_in[0], main_ctx.off_vir_in[1], main_ctx.off_vir_in[2], main_ctx.off_vir_in[3], main_ctx.off_vir_in[4], main_ctx.off_vir_in[5], main_ctx.off_vir_in[6], main_ctx.off_vir_in[7]);
-
+  if(fwrite(&s_data, sizeof(s_data), 1, main_ctx.sfp[0]) != 1) return false;
   fflush (main_ctx.sfp[0]);
-
-  if (ftruncate (fileno (main_ctx.sfp[0]), ftell (main_ctx.sfp[0])) != 0)
-  {
-    fprintf (stderr, "! ftruncate() failed (%d): %s\n", errno, strerror (errno));
-    fclose (main_ctx.sfp[0]); main_ctx.sfp[0] = NULL;
-    return false;
-  }
-
+  fsync (fileno(main_ctx.sfp[0]));
   return true;
 }
 
@@ -716,7 +719,7 @@ static const char *short_options = "1:2:3:4:5:6:7:8:S:L:s:r:m:l:hv";
       { \
         main_ctx.limit--; \
         end2 = (limit_isSet && main_ctx.limit == 0) ? true : false; \
-        if (end2) break; \
+        if (end2) return; \
       } \
     } \
   } \
@@ -781,6 +784,99 @@ static void usage (char *p)
     "['one . two + three @ four,*]\n\n");
 }
 
+static bool load_all_files_to_ram(){
+  for (int i = 0; i < 8; i++) {
+    if (main_ctx.f[i] == NULL) continue;
+
+    int fd = open(main_ctx.f[i], O_RDONLY);
+    if (fd < 0) {
+      fprintf(stderr, "! Cannot open file %s\n", main_ctx.f[i]);
+      return false;
+    }
+
+    struct stat sb;
+    fstat(fd, &sb);
+    main_ctx.file_sizes[i] = sb.st_size;
+
+    if (sb.st_size == 0) {
+      close(fd);
+      continue;
+    }
+
+    main_ctx.file_buffer[i] = mmap(NULL, sb.st_size, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0);
+    close(fd);
+
+    if (main_ctx.file_buffer[i] == MAP_FAILED) {
+      fprintf(stderr, "! mmap failed for file %s\n", main_ctx.f[i]);
+      return false;
+    }
+
+    // Đếm số dòng
+    uint64_t lines = 0;
+    for (uint64_t j = 0; j < sb.st_size; j++) {
+      if (main_ctx.file_buffer[i][j] == '\n') lines++;
+    }
+    if (main_ctx.file_buffer[i][sb.st_size - 1] != '\n') lines++;
+
+    main_ctx.total_lines[i] = lines;
+    main_ctx.file_lines[i] = malloc(lines * sizeof(char *));
+    main_ctx.line_lens[i] = malloc(lines * sizeof(uint64_t));
+
+    // Tách dòng
+    uint64_t current_line = 0;
+    char *start = main_ctx.file_buffer[i];
+
+    for (uint64_t j = 0; j < sb.st_size; j++) {
+      if (main_ctx.file_buffer[i][j] == '\r') {
+        // Biến \r thành chuỗi kết thúc để loại bỏ nó (xử lý file Windows)
+        main_ctx.file_buffer[i][j] = '\0'; 
+      } 
+      else if (main_ctx.file_buffer[i][j] == '\n') {
+        main_ctx.file_buffer[i][j] = '\0';
+        main_ctx.file_lines[i][current_line] = start;
+        // Dùng strlen sẽ tự động bỏ qua \r nếu file định dạng Windows
+        main_ctx.line_lens[i][current_line] = strlen(start); 
+        start = main_ctx.file_buffer[i] + j + 1;
+        current_line++;
+      }
+    }
+    if (current_line < lines) {
+      main_ctx.file_lines[i][current_line] = start;
+      main_ctx.line_lens[i][current_line] = strlen(start);
+    }
+  }
+  return true;
+}
+
+static void generate_combinations(int file_idx, char *ptr_in[8], uint64_t vir_in[8], char *buf_out, char **ptr_out, bool limit_isSet, bool skip_isSet, bool session_isSet, bool restore_isSet){
+  if (end || end2) return;
+
+  // Nếu file_idx hiện tại không được set, bỏ qua và đi tiếp
+  if (file_idx < 8 && main_ctx.file_lines[file_idx] == NULL) {
+    generate_combinations(file_idx + 1, ptr_in, vir_in, buf_out, ptr_out, limit_isSet, skip_isSet, session_isSet, restore_isSet);
+    return;
+  }
+
+  // Đã đi qua đủ 8 file, tiến hành build output
+  if (file_idx == 8) {
+    ADD_TO_OUTPUT_BUFFER(buf_out, *ptr_out, ptr_in, vir_in, main_ctx.sepStart, main_ctx.sepStart_len, main_ctx.sep, main_ctx.sep_len, main_ctx.sepEnd, main_ctx.sepEnd_len);
+    return;
+  }
+
+  for (uint64_t i = main_ctx.cur_rep[file_idx]; i < main_ctx.total_lines[file_idx]; i++) {
+    ptr_in[file_idx] = main_ctx.file_lines[file_idx][i];
+    vir_in[file_idx] = main_ctx.line_lens[file_idx][i];
+    
+    // Đệ quy sâu xuống file tiếp theo
+    generate_combinations(file_idx + 1, ptr_in, vir_in, buf_out, ptr_out, limit_isSet, skip_isSet, session_isSet, restore_isSet);
+
+    if (end || end2) return;
+  }
+
+  // Reset index sau khi vòng lặp của file này hoàn thành
+  main_ctx.cur_rep[file_idx] = 0;
+}
+
 int main (int argc, char *argv[])
 {
   int opt = 0;
@@ -793,7 +889,6 @@ int main (int argc, char *argv[])
 
   char *sepFill = NULL;
   uint64_t sepFill_len = 0;
-  uint64_t maxRepCheck = 0;
 
   bool limit_isSet = false;
   bool skip_isSet = false;
@@ -804,7 +899,11 @@ int main (int argc, char *argv[])
 
   memset (&main_ctx, 0, sizeof (cx_session_t));
 
-  for (int i = 0; i < 8; i++) main_ctx.fp[i] = NULL;
+  for (int i = 0; i < 8; i++) {
+    main_ctx.fp[i] = NULL;
+    main_ctx.file_buffer[i] = NULL;
+    main_ctx.file_lines[i] = NULL;
+  }
 
   for (int i = 0; i < 7; i++)
   {
@@ -820,883 +919,116 @@ int main (int argc, char *argv[])
   {
     switch (opt)
     {
-      case 0xa0:
-        main_ctx.sepStart_len = strlen(optarg);
-        main_ctx.sepStart = strdup(optarg);
-
-        MEMORY_FREE_ADD(main_ctx.sepStart)
-        break;
-
-      case 0xa1:
-        main_ctx.sep_len[0] = strlen(optarg);
-        main_ctx.sep[0] = strdup(optarg);
-
-        MEMORY_FREE_ADD(main_ctx.sep[0])
-        break;
-
-      case 0xa2:
-        main_ctx.sep_len[1] = strlen(optarg);
-        main_ctx.sep[1] = strdup(optarg);
-
-        MEMORY_FREE_ADD(main_ctx.sep[1])
-        break;
-
-      case 0xa3:
-        main_ctx.sep_len[2] = strlen(optarg);
-        main_ctx.sep[2] = strdup(optarg);
-
-        MEMORY_FREE_ADD(main_ctx.sep[2])
-        break;
-
-      case 0xa4:
-        main_ctx.sep_len[3] = strlen(optarg);
-        main_ctx.sep[3] = strdup(optarg);
-
-        MEMORY_FREE_ADD(main_ctx.sep[3])
-        break;
-
-      case 0xa5:
-        main_ctx.sep_len[4] = strlen(optarg);
-        main_ctx.sep[4] = strdup(optarg);
-
-        MEMORY_FREE_ADD(main_ctx.sep[4])
-        break;
-
-      case 0xa6:
-        main_ctx.sep_len[5] = strlen(optarg);
-        main_ctx.sep[5] = strdup(optarg);
-
-        MEMORY_FREE_ADD(main_ctx.sep[5])
-        break;
-
-      case 0xa7:
-        main_ctx.sep_len[6] = strlen(optarg);
-        main_ctx.sep[6] = strdup(optarg);
-
-        MEMORY_FREE_ADD(main_ctx.sep[6])
-        break;
-
-      case 0xaf:
-        main_ctx.sepEnd_len = strlen(optarg);
-        main_ctx.sepEnd = strdup(optarg);
-
-        MEMORY_FREE_ADD(main_ctx.sepEnd)
-        break;
-
-      case 0xb0:
-        sepFill_len = strlen(optarg);
-        sepFill = strdup(optarg);
-
-        MEMORY_FREE_ADD(sepFill)
-        break;
-
-      case '1':
-        if (strlen (optarg) > 0 && access (optarg, F_OK) == 0) { main_ctx.f[0] = strdup (optarg); set++; MEMORY_FREE_ADD(main_ctx.f[0]); }
-        else err++;
-        break;
-
-      case '2':
-        if (strlen (optarg) > 0 && access (optarg, F_OK) == 0) { main_ctx.f[1] = strdup (optarg); set++; MEMORY_FREE_ADD(main_ctx.f[1]); }
-        else err++;
-        break;
-
-      case '3':
-        if (strlen (optarg) > 0 && access (optarg, F_OK) == 0) { main_ctx.f[2] = strdup (optarg); MEMORY_FREE_ADD(main_ctx.f[2]); }
-        else err++;
-        break;
-
-      case '4':
-        if (strlen (optarg) > 0 && access (optarg, F_OK) == 0) { main_ctx.f[3] = strdup (optarg); MEMORY_FREE_ADD(main_ctx.f[3]); }
-        else err++;
-        break;
-
-      case '5':
-        if (strlen (optarg) > 0 && access (optarg, F_OK) == 0) { main_ctx.f[4] = strdup (optarg); MEMORY_FREE_ADD(main_ctx.f[4]); }
-        else err++;
-        break;
-
-      case '6':
-        if (strlen (optarg) > 0 && access (optarg, F_OK) == 0) { main_ctx.f[5] = strdup (optarg); MEMORY_FREE_ADD(main_ctx.f[5]); }
-        else err++;
-        break;
-
-      case '7':
-        if (strlen (optarg) > 0 && access (optarg, F_OK) == 0) { main_ctx.f[6] = strdup (optarg); MEMORY_FREE_ADD(main_ctx.f[6]); }
-        else err++;
-        break;
-
-      case '8':
-        if (strlen (optarg) > 0 && access (optarg, F_OK) == 0) { main_ctx.f[7] = strdup (optarg); MEMORY_FREE_ADD(main_ctx.f[7]); }
-        else err++;
-        break;
-
-      case 'S':
-        skip_isSet = true;
-        main_ctx.skip = strtoul (optarg, NULL, 10);
-        if (main_ctx.skip == 0)
-        {
-          fprintf (stderr, "! Invalid skip argument: must be > 0\n");
-          err++;
-        }
-        break;
-
-      case 'L':
-        limit_isSet = true;
-        main_ctx.limit = strtoul (optarg, NULL, 10);
-        if (main_ctx.limit == 0)
-        {
-          fprintf (stderr, "! Invalid limit argument: must be > 0\n");
-          err++;
-        }
-        break;
-
-      case 's':
-        session_isSet = true;
-        if (strlen (optarg) > 0)
-        {
-          if (access (optarg, R_OK) != 0)
-          {
-            main_ctx.sessionName = strdup (optarg);
-            MEMORY_FREE_ADD(main_ctx.sessionName)
-          }
-          else
-          {
-            fprintf (stderr, "! session file already exists\n\n");
-            err++;
-          }
-        }
-        else
-        {
-          err++;
-        }
-        break;
-
-      case 'r':
-        restore_isSet = true;
-        if (strlen (optarg) > 0)
-        {
-          if (access (optarg, R_OK) == 0)
-          {
-            main_ctx.sessionName = strdup (optarg);
-            MEMORY_FREE_ADD(main_ctx.sessionName)
-          }
-          else
-          {
-            fprintf (stderr, "! session file does not exist\n\n");
-            err++;
-          }
-        }
-        else
-        {
-          err++;
-        }
-        break;
-
-      case 'm':
-        main_ctx.maxRep = strtoul (optarg, NULL, 10);
-        if (main_ctx.maxRep > 0) maxRep_isSet = true;
-        break;
-
-      case 'l':
-        main_ctx.maxLen = strtoul (optarg, NULL, 10);
-        if (main_ctx.maxLen > 0) maxLen_isSet = true;
-        break;
-
-      #ifdef DEBUG
-      case 'd':
-        debug = true;
-        break;
-      #endif
-
-      case 'v':
-        show_version ();
-        MEMORY_FREE_ALL
-        return 0;
-
-      case 'h':
-        usage (argv[0]);
-        MEMORY_FREE_ALL
-        return 0;
-
-      default:
-        err++;
-        break;
+      case 0xa0: main_ctx.sepStart_len = strlen(optarg); main_ctx.sepStart = strdup(optarg); MEMORY_FREE_ADD(main_ctx.sepStart) break;
+      case 0xa1: main_ctx.sep_len[0] = strlen(optarg); main_ctx.sep[0] = strdup(optarg); MEMORY_FREE_ADD(main_ctx.sep[0]) break;
+      case 0xa2: main_ctx.sep_len[1] = strlen(optarg); main_ctx.sep[1] = strdup(optarg); MEMORY_FREE_ADD(main_ctx.sep[1]) break;
+      case 0xa3: main_ctx.sep_len[2] = strlen(optarg); main_ctx.sep[2] = strdup(optarg); MEMORY_FREE_ADD(main_ctx.sep[2]) break;
+      case 0xa4: main_ctx.sep_len[3] = strlen(optarg); main_ctx.sep[3] = strdup(optarg); MEMORY_FREE_ADD(main_ctx.sep[3]) break;
+      case 0xa5: main_ctx.sep_len[4] = strlen(optarg); main_ctx.sep[4] = strdup(optarg); MEMORY_FREE_ADD(main_ctx.sep[4]) break;
+      case 0xa6: main_ctx.sep_len[5] = strlen(optarg); main_ctx.sep[5] = strdup(optarg); MEMORY_FREE_ADD(main_ctx.sep[5]) break;
+      case 0xa7: main_ctx.sep_len[6] = strlen(optarg); main_ctx.sep[6] = strdup(optarg); MEMORY_FREE_ADD(main_ctx.sep[6]) break;
+      case 0xaf: main_ctx.sepEnd_len = strlen(optarg); main_ctx.sepEnd = strdup(optarg); MEMORY_FREE_ADD(main_ctx.sepEnd) break;
+      case 0xb0: sepFill_len = strlen(optarg); sepFill = strdup(optarg); MEMORY_FREE_ADD(sepFill) break;
+      case '1': if (strlen (optarg) > 0 && access (optarg, F_OK) == 0) { main_ctx.f[0] = strdup (optarg); set++; MEMORY_FREE_ADD(main_ctx.f[0]); } else err++; break;
+      case '2': if (strlen (optarg) > 0 && access (optarg, F_OK) == 0) { main_ctx.f[1] = strdup (optarg); set++; MEMORY_FREE_ADD(main_ctx.f[1]); } else err++; break;
+      case '3': if (strlen (optarg) > 0 && access (optarg, F_OK) == 0) { main_ctx.f[2] = strdup (optarg); MEMORY_FREE_ADD(main_ctx.f[2]); } else err++; break;
+      case '4': if (strlen (optarg) > 0 && access (optarg, F_OK) == 0) { main_ctx.f[3] = strdup (optarg); MEMORY_FREE_ADD(main_ctx.f[3]); } else err++; break;
+      case '5': if (strlen (optarg) > 0 && access (optarg, F_OK) == 0) { main_ctx.f[4] = strdup (optarg); MEMORY_FREE_ADD(main_ctx.f[4]); } else err++; break;
+      case '6': if (strlen (optarg) > 0 && access (optarg, F_OK) == 0) { main_ctx.f[5] = strdup (optarg); MEMORY_FREE_ADD(main_ctx.f[5]); } else err++; break;
+      case '7': if (strlen (optarg) > 0 && access (optarg, F_OK) == 0) { main_ctx.f[6] = strdup (optarg); MEMORY_FREE_ADD(main_ctx.f[6]); } else err++; break;
+      case '8': if (strlen (optarg) > 0 && access (optarg, F_OK) == 0) { main_ctx.f[7] = strdup (optarg); MEMORY_FREE_ADD(main_ctx.f[7]); } else err++; break;
+      case 'S': skip_isSet = true; main_ctx.skip = strtoul (optarg, NULL, 10); if (main_ctx.skip == 0) { fprintf (stderr, "! Invalid skip argument: must be > 0\n"); err++; } break;
+      case 'L': limit_isSet = true; main_ctx.limit = strtoul (optarg, NULL, 10); if (main_ctx.limit == 0) { fprintf (stderr, "! Invalid limit argument: must be > 0\n"); err++; } break;
+      case 's': session_isSet = true; if (strlen (optarg) > 0) { if (access (optarg, R_OK) != 0) { main_ctx.sessionName = strdup (optarg); MEMORY_FREE_ADD(main_ctx.sessionName) } else { fprintf (stderr, "! session file already exists\n\n"); err++; } } else err++; break;
+      case 'r': restore_isSet = true; if (strlen (optarg) > 0) { main_ctx.sessionName = strdup (optarg); MEMORY_FREE_ADD(main_ctx.sessionName) } else err++; break;
+      case 'm': maxRep_isSet = true; main_ctx.maxRep = strtoul(optarg, NULL, 10); break;
+      case 'l': maxLen_isSet = true; main_ctx.maxLen = strtoul(optarg, NULL, 10); break;
+      case 'v': show_version(); return 0;
+      case 'h': usage(argv[0]); return 0;
+#ifdef DEBUG
+      case 'd': debug = true; break;
+#endif
+      default: err++; break;
     }
   }
 
-  if (restore_isSet == false)
+  if (err > 0 || (!restore_isSet && set < 2))
   {
-    if (err > 0 || set != 2)
-    {
-      fprintf (stderr, "! Detected invalid/missing argument(s) ...\n");
-      usage (argv[0]);
+    usage(argv[0]);
+    EXIT_WITH_RET(-1);
+  }
 
-      MEMORY_FREE_ALL
-      return -1;
+  // Khởi tạo session (nếu có)
+  if (session_isSet || restore_isSet)
+  {
+    if (!session_init(session_isSet, restore_isSet)) {
+      EXIT_WITH_RET(-1);
     }
   }
 
-  // force using sequentials arguments to test wordlists
-
-  for (int i = 0; i < 8; i++)
-  {
-    if (main_ctx.f[i] != NULL) continue;
-
-    for (int j = i; j < 8; j++)
-    {
-      if (main_ctx.f[j] != NULL)
-      {
-        i++;
-        j++;
-        fprintf (stderr, "! Cannot set --file%d/-%d if --file%d/-%d is not set\n", j, j, i, i);
-        usage (argv[0]);
-
-        MEMORY_FREE_ALL
-        return -1;
+  // Xử lý điền kí tự sepFill (nếu có)
+  if (sepFill != NULL && sepFill_len > 0) {
+    for (int i=0; i<7; i++) {
+      if (main_ctx.f[i+1] != NULL && main_ctx.sep[i] == NULL) {
+        main_ctx.sep[i] = strdup(sepFill);
+        main_ctx.sep_len[i] = sepFill_len;
+        MEMORY_FREE_ADD(main_ctx.sep[i]);
       }
     }
   }
 
-  if (sepFill == NULL)
-  {
-    for (int i = 0; i < 7; i++)
-    {
-      if (main_ctx.sep[i] != NULL && main_ctx.f[i+1] == NULL)
-      {
-          i++;
-          fprintf (stderr, "! Cannot set --sep%d if --file%d is not set\n", i, i+1);
-          usage (argv[0]);
+  // Bắt tín hiệu ngắt (Ctrl + C)
+  signal (SIGINT, sigHandler);
 
-          MEMORY_FREE_ALL
-          return -1;
-      }
-    }
+  // 1. Tải toàn bộ file đã cung cấp vào RAM thay vì đọc từng dòng
+  if (!load_all_files_to_ram()) {
+    fprintf(stderr, "! Error loading files to RAM. OOM or missing file.\n");
+    EXIT_WITH_RET(-1);
   }
 
-  for (int i = 0; i < 8; i++)
-  {
-    if (main_ctx.f[i] != NULL)
-    {
-      for (int j = i-1; j > 0; j--)
-      {
-        if (main_ctx.f[j] == NULL) continue;
-
-        if (!strcmp (main_ctx.f[j], main_ctx.f[i]))
-        {
-          fprintf (stderr, "! Cannot use the same file as input (%s vs %s) ...\n", main_ctx.f[j], main_ctx.f[i]);
-          usage (argv[0]);
-
-          MEMORY_FREE_ALL
-          return -1;
-        }
-      }
-
-      maxRepCheck++;
-
-      int sepId = i - 1;
-
-      if (sepId >= 0)
-      {
-        if (sepFill && main_ctx.sep[sepId] == false)
-        {
-          main_ctx.sep_len[sepId] = sepFill_len;
-          main_ctx.sep[sepId] = strdup(sepFill);
-
-          MEMORY_FREE_ADD(main_ctx.sep[sepId])
-        }
-      }
-    }
+  // 2. Cấp phát Memory Buffer để in ra
+  char *buf_out = (char *) malloc (SEGMENT_SIZE);
+  if (buf_out == NULL) {
+    fprintf(stderr, "! Cannot allocate output buffer.\n");
+    EXIT_WITH_RET(-1);
   }
-
-  if (maxRep_isSet)
-  {
-    if (main_ctx.maxRep >= maxRepCheck)
-    {
-      fprintf (stderr, "! Invalid --maxRep value: cannot be greater than the number of input files opened\n");
-
-      MEMORY_FREE_ALL
-      return -1;
-    }
-  }
-
-  if (maxLen_isSet)
-  {
-    if (main_ctx.maxLen < maxRepCheck)
-    {
-      fprintf (stderr, "! Invalid --maxLen value: cannot be smaller than the number of input files opened\n");
-
-      MEMORY_FREE_ALL
-      return -1;
-    }
-  }
-
-  if (session_isSet && restore_isSet)
-  {
-    fprintf (stderr, "! Cannot use --session and --restore together ...\n");
-    usage (argv[0]);
-
-    MEMORY_FREE_ALL
-    return -1;
-  }
-
-  // init session
-  char *ptr_in[8];
-  uint64_t vir_in[8];
-  int64_t off_vir_in_init[8];
-  uint64_t real_sz[8];
-  uint64_t len_in[8];
-  char *max_in[8];
-
-  for (int i = 0; i < 8; i++)
-  {
-    ptr_in[i] = NULL;
-    vir_in[i] = 0;
-    off_vir_in_init[i] = 0;
-    real_sz[i] = 0;
-    len_in[i] = 0;
-    max_in[i] = NULL;
-  }
-
-  memset (main_ctx.off_fd, 0, sizeof (main_ctx.off_fd));
-
-  if (session_init (session_isSet, restore_isSet) == false)
-  {
-    MEMORY_FREE_ALL
-    return -1;
-  }
-
-  if (restore_isSet)
-  {
-    if (main_ctx.limit > 0) limit_isSet = true;
-    if (main_ctx.skip > 0) skip_isSet = true;
-    if (main_ctx.maxRep > 0 && main_ctx.maxRep < maxRepCheck) maxRep_isSet = true;
-    if (main_ctx.maxLen > 0 && main_ctx.maxLen >= maxRepCheck) maxLen_isSet = true;
-  }
-
-  #ifdef DEBUG
-  if (debug)
-  {
-    session_print();
-  }
-  #endif
-
-  // init session done
-
-  // setup signal handler if session/restore is enabled
-  if (main_ctx.sessionName != NULL)
-  {
-    signal (SIGINT, sigHandler);
-  }
-
-  uint64_t sz_buf = SEGMENT_SIZE + SEGMENT_ALIGN;
-
-  char *buf_in[8];
-
-  for (int i = 0; i < 8; i++)
-  {
-    buf_in[i] = NULL;
-
-    if (main_ctx.f[i] != NULL)
-    {
-      buf_in[i] = (char *) malloc (sz_buf);
-
-      MEMORY_FREE_ADD (buf_in[i])
-    }
-  }
-
-  char *buf_out = (char *) malloc (sz_buf);
-
-  MEMORY_FREE_ADD (buf_out)
+  MEMORY_FREE_ADD(buf_out);
 
   char *ptr_out = buf_out;
+  char *ptr_in[8];
+  uint64_t vir_in[8];
 
-  main_ctx.max_skip = 1;
-  main_ctx.max_files = 0;
-
-  for (int i = 0; i < 8; i++)
-  {
-    if (main_ctx.f[i] && (main_ctx.fp[i] = fopen (main_ctx.f[i], "rb")) == NULL)
-    {
-      fprintf (stderr, "fopen(%s): %s\n", main_ctx.f[i], strerror (errno));
-
-      for (; i > 0; i--) { fclose (main_ctx.fp[i]); main_ctx.fp[i] = NULL; }
-
-      MEMORY_FREE_ALL
-      if (main_ctx.sfp[0] != NULL) fclose (main_ctx.sfp[0]);
-      return (-1);
-    }
-
-    if (main_ctx.f[i] != NULL)
-    {
-      main_ctx.lines[i] = 0;
-
-      while(!feof(main_ctx.fp[i]))
-      {
-        if (fgetc(main_ctx.fp[i]) == '\n')
-          main_ctx.lines[i]++;
-      }
-
-      rewind (main_ctx.fp[i]);
-
-      main_ctx.max_skip *= main_ctx.lines[i];
-      main_ctx.max_files++;
-    }
+  for (int i = 0; i < 8; i++) {
+    ptr_in[i] = NULL;
+    vir_in[i] = 0;
   }
 
-  #ifdef DEBUG
-  if (debug) fprintf (stderr, "Max skip: %" PRIu64 "\n", main_ctx.max_skip);
-  #endif
+  // 3. Khởi chạy vòng lặp sinh tổ hợp bằng đệ quy trên RAM
+  generate_combinations(0, ptr_in, vir_in, buf_out, &ptr_out, limit_isSet, skip_isSet, session_isSet, restore_isSet);
 
-  if (main_ctx.skip > 0 && main_ctx.skip >= main_ctx.max_skip)
-  {
-    // argument or restore file
-    fprintf (stderr, "! Invalid argument: skip (max detected: %" PRIu64 ")\n", main_ctx.max_skip-1);
-    if (main_ctx.sfp[0] != NULL) fclose (main_ctx.sfp[0]);
-    MEMORY_FREE_ALL
-    return (-1);
-  }
-
-  if (restore_isSet)
-  {
-    for (int i = 0; i < 8; i++) off_vir_in_init[i] = main_ctx.off_vir_in[i];
-    for (int i = 0; i < 8; i++) if (main_ctx.off_fd[i] > 0 && main_ctx.fp[i] != NULL) fseek (main_ctx.fp[i], main_ctx.off_fd[i], SEEK_SET);
-
-    // reset main counters
-    for (int i = 0; i < 8; i++) main_ctx.off_fd[i] = 0;
-    for (int i = 0; i < 8; i++) main_ctx.off_vir_in[i] = 0;
-  }
-
-  while (!feof (main_ctx.fp[0]) && !end && !end2)
-  {
-    main_ctx.off_fd[0] = ftell (main_ctx.fp[0]);
-
-    real_sz[0] = read_segment (buf_in[0], main_ctx.fp[0]);
-    len_in[0] = 0;
-    max_in[0] = buf_in[0] + real_sz[0];
-
-    for (ptr_in[0] = buf_in[0]; ptr_in[0] < max_in[0] && !end; ptr_in[0] += len_in[0] + 1)
-    {
-      main_ctx.cur_rep[0] = 0;
-
-      len_in[0] = get_line_len (ptr_in[0], max_in[0]);
-      vir_in[0] = len_in[0];
-
-      while (vir_in[0])
-      {
-        if (ptr_in[0][vir_in[0] - 1] != '\r') break;
-        vir_in[0]--;
-      }
-
-      if (vir_in[0] > WORD_MAX_LEN) continue;
-      if (maxLen_isSet && vir_in[0] > main_ctx.maxLen) continue;
-
-      // restore 1 if needed
-      main_ctx.off_vir_in[0] += vir_in[0];
-      if (restore_isSet && off_vir_in_init[0] >= 0 && main_ctx.off_vir_in[0] < off_vir_in_init[0]) continue;
-      off_vir_in_init[0] = -1;
-
-      while (!feof (main_ctx.fp[1]) && !end && !end2)
-      {
-        main_ctx.off_fd[1] = ftell (main_ctx.fp[1]);
-
-        real_sz[1] = read_segment (buf_in[1], main_ctx.fp[1]);
-        len_in[1] = 0;
-        max_in[1] = buf_in[1] + real_sz[1];
-
-        for (ptr_in[1] = buf_in[1]; ptr_in[1] < max_in[1] && !end; ptr_in[1] += len_in[1] + 1)
-        {
-          main_ctx.cur_rep[1] = 0;
-
-          len_in[1] = get_line_len (ptr_in[1], max_in[1]);
-          vir_in[1] = len_in[1];
-
-          while (vir_in[1])
-          {
-            if (ptr_in[1][vir_in[1] - 1] != '\r') break;
-            vir_in[1]--;
-          }
-
-          if (vir_in[1] > WORD_MAX_LEN) continue;
-          if (maxLen_isSet && (vir_in[0]+vir_in[1]) > main_ctx.maxLen) continue;
-
-          // restore 2 if needed
-          main_ctx.off_vir_in[1] += vir_in[1];
-          if (restore_isSet && off_vir_in_init[1] >= 0 && main_ctx.off_vir_in[1] < off_vir_in_init[1]) continue;
-          off_vir_in_init[1] = -1;
-
-          if (maxRep_isSet)
-          {
-            if (vir_in[1] == vir_in[0] && memcmp (ptr_in[0], ptr_in[1], vir_in[0]) == 0)
-            {
-              ++main_ctx.cur_rep[1];
-              if ((main_ctx.cur_rep[0]+main_ctx.cur_rep[1]) >= main_ctx.maxRep) continue;
-            }
-          }
-
-          if (buf_in[2])
-          {
-            while (!feof (main_ctx.fp[2]) && !end && !end2)
-            {
-              main_ctx.off_fd[2] = ftell (main_ctx.fp[2]);
-
-              real_sz[2] = read_segment (buf_in[2], main_ctx.fp[2]);
-              len_in[2] = 0;
-              max_in[2] = buf_in[2] + real_sz[2];
-
-              for (ptr_in[2] = buf_in[2]; ptr_in[2] < max_in[2] && !end; ptr_in[2] += len_in[2] + 1)
-              {
-                main_ctx.cur_rep[2] = 0;
-
-                len_in[2] = get_line_len (ptr_in[2], max_in[2]);
-                vir_in[2] = len_in[2];
-
-                while (vir_in[2])
-                {
-                  if (ptr_in[2][vir_in[2] - 1] != '\r') break;
-                  vir_in[2]--;
-                }
-
-                if (vir_in[2] > WORD_MAX_LEN) continue;
-                if (maxLen_isSet && (vir_in[0]+vir_in[1]+vir_in[2]) > main_ctx.maxLen) continue;
-
-                // restore 3 if needed
-                main_ctx.off_vir_in[2] += vir_in[2];
-                if (restore_isSet && off_vir_in_init[2] >= 0 && main_ctx.off_vir_in[2] < off_vir_in_init[2]) continue;
-                off_vir_in_init[2] = -1;
-
-                if (maxRep_isSet)
-                {
-                  if ((vir_in[2] == vir_in[1] && memcmp (ptr_in[2], ptr_in[1], vir_in[1]) == 0) ||
-                      (vir_in[2] == vir_in[0] && memcmp (ptr_in[2], ptr_in[0], vir_in[0]) == 0))
-                  {
-                    ++main_ctx.cur_rep[2];
-                    if ((main_ctx.cur_rep[0]+main_ctx.cur_rep[1]+main_ctx.cur_rep[2]) >= main_ctx.maxRep) continue;
-                  }
-                }
-
-                if (buf_in[3])
-                {
-                  while (!feof (main_ctx.fp[3]) && !end && !end2)
-                  {
-                    main_ctx.off_fd[3] = ftell (main_ctx.fp[3]);
-
-                    real_sz[3] = read_segment (buf_in[3], main_ctx.fp[3]);
-                    len_in[3] = 0;
-                    max_in[3] = buf_in[3] + real_sz[3];
-
-                    for (ptr_in[3] = buf_in[3]; ptr_in[3] < max_in[3] && !end; ptr_in[3] += len_in[3] + 1)
-                    {
-                      main_ctx.cur_rep[3] = 0;
-
-                      len_in[3] = get_line_len (ptr_in[3], max_in[3]);
-                      vir_in[3] = len_in[3];
-
-                      while (vir_in[3])
-                      {
-                        if (ptr_in[3][vir_in[3] - 1] != '\r') break;
-                        vir_in[3]--;
-                      }
-
-                      if (vir_in[3] > WORD_MAX_LEN) continue;
-                      if (maxLen_isSet && (vir_in[0]+vir_in[1]+vir_in[2]+vir_in[3]) > main_ctx.maxLen) continue;
-
-                      // restore 4 if needed
-                      main_ctx.off_vir_in[3] += vir_in[3];
-                      if (restore_isSet && off_vir_in_init[3] >= 0 && main_ctx.off_vir_in[3] < off_vir_in_init[3]) continue;
-                      off_vir_in_init[3] = -1;
-
-                      if (maxRep_isSet)
-                      {
-                        if ((vir_in[3] == vir_in[2] && memcmp (ptr_in[3], ptr_in[2], vir_in[2]) == 0) ||
-                            (vir_in[3] == vir_in[1] && memcmp (ptr_in[3], ptr_in[1], vir_in[1]) == 0) ||
-                            (vir_in[3] == vir_in[0] && memcmp (ptr_in[3], ptr_in[0], vir_in[0]) == 0))
-                        {
-                          ++main_ctx.cur_rep[3];
-                          if ((main_ctx.cur_rep[0]+main_ctx.cur_rep[1]+main_ctx.cur_rep[2]+main_ctx.cur_rep[3]) >= main_ctx.maxRep) continue;
-                        }
-                      }
-
-                      if (buf_in[4])
-                      {
-                        while (!feof (main_ctx.fp[4]) && !end && !end2)
-                        {
-                          main_ctx.off_fd[4] = ftell (main_ctx.fp[4]);
-
-                          real_sz[4] = read_segment (buf_in[4], main_ctx.fp[4]);
-                          len_in[4] = 0;
-                          max_in[4] = buf_in[4] + real_sz[4];
-
-                          for (ptr_in[4] = buf_in[4]; ptr_in[4] < max_in[4] && !end; ptr_in[4] += len_in[4] + 1)
-                          {
-                            main_ctx.cur_rep[4] = 0;
-
-                            len_in[4] = get_line_len (ptr_in[4], max_in[4]);
-                            vir_in[4] = len_in[4];
-
-                            while (vir_in[4])
-                            {
-                              if (ptr_in[4][vir_in[4] - 1] != '\r') break;
-                              vir_in[4]--;
-                            }
-
-                            if (vir_in[4] > WORD_MAX_LEN) continue;
-                            if (maxLen_isSet && (vir_in[0]+vir_in[1]+vir_in[2]+vir_in[3]+vir_in[4]) > main_ctx.maxLen) continue;
-
-                            // restore 5 if needed
-                            main_ctx.off_vir_in[4] += vir_in[4];
-                            if (restore_isSet && off_vir_in_init[4] >= 0 && main_ctx.off_vir_in[4] < off_vir_in_init[4]) continue;
-                            off_vir_in_init[4] = -1;
-
-                            if (maxRep_isSet)
-                            {
-                              if ((vir_in[4] == vir_in[3] && memcmp (ptr_in[4], ptr_in[3], vir_in[3]) == 0) ||
-                                  (vir_in[4] == vir_in[2] && memcmp (ptr_in[4], ptr_in[2], vir_in[2]) == 0) ||
-                                  (vir_in[4] == vir_in[1] && memcmp (ptr_in[4], ptr_in[1], vir_in[1]) == 0) ||
-                                  (vir_in[4] == vir_in[0] && memcmp (ptr_in[4], ptr_in[0], vir_in[0]) == 0))
-                              {
-                                ++main_ctx.cur_rep[4];
-                                if ((main_ctx.cur_rep[0]+main_ctx.cur_rep[1]+main_ctx.cur_rep[2]+main_ctx.cur_rep[3]+main_ctx.cur_rep[4]) >= main_ctx.maxRep) continue;
-                              }
-                            }
-
-                            if (buf_in[5])
-                            {
-                              while (!feof (main_ctx.fp[5]) && !end && !end2)
-                              {
-                                main_ctx.off_fd[5] = ftell (main_ctx.fp[5]);
-
-                                real_sz[5] = read_segment (buf_in[5], main_ctx.fp[5]);
-                                len_in[5] = 0;
-                                max_in[5] = buf_in[5] + real_sz[5];
-
-                                for (ptr_in[5] = buf_in[5]; ptr_in[5] < max_in[5] && !end; ptr_in[5] += len_in[5] + 1)
-                                {
-                                  main_ctx.cur_rep[5] = 0;
-
-                                  len_in[5] = get_line_len (ptr_in[5], max_in[5]);
-                                  vir_in[5] = len_in[5];
-
-                                  while (vir_in[5])
-                                  {
-                                    if (ptr_in[5][vir_in[5] - 1] != '\r') break;
-                                    vir_in[5]--;
-                                  }
-
-                                  if (vir_in[5] > WORD_MAX_LEN) continue;
-                                  if (maxLen_isSet && (vir_in[0]+vir_in[1]+vir_in[2]+vir_in[3]+vir_in[4]+vir_in[5]) > main_ctx.maxLen) continue;
-
-                                  // restore 6 if needed
-                                  main_ctx.off_vir_in[5] += vir_in[5];
-                                  if (restore_isSet && off_vir_in_init[5] >= 0 && main_ctx.off_vir_in[5] < off_vir_in_init[5]) continue;
-                                  off_vir_in_init[5] = -1;
-
-                                  if (maxRep_isSet)
-                                  {
-                                    if ((vir_in[5] == vir_in[4] && memcmp (ptr_in[5], ptr_in[4], vir_in[4]) == 0) ||
-                                        (vir_in[5] == vir_in[3] && memcmp (ptr_in[5], ptr_in[3], vir_in[3]) == 0) ||
-                                        (vir_in[5] == vir_in[2] && memcmp (ptr_in[5], ptr_in[2], vir_in[2]) == 0) ||
-                                        (vir_in[5] == vir_in[1] && memcmp (ptr_in[5], ptr_in[1], vir_in[1]) == 0) ||
-                                        (vir_in[5] == vir_in[0] && memcmp (ptr_in[5], ptr_in[0], vir_in[0]) == 0))
-                                    {
-                                      ++main_ctx.cur_rep[5];
-                                      if ((main_ctx.cur_rep[0]+main_ctx.cur_rep[1]+main_ctx.cur_rep[2]+main_ctx.cur_rep[3]+main_ctx.cur_rep[4]+main_ctx.cur_rep[5]) >= main_ctx.maxRep) continue;
-                                    }
-                                  }
-
-                                  if (buf_in[6])
-                                  {
-                                    while (!feof (main_ctx.fp[6]) && !end && !end2)
-                                    {
-                                      main_ctx.off_fd[6] = ftell (main_ctx.fp[6]);
-
-                                      real_sz[6] = read_segment (buf_in[6], main_ctx.fp[6]);
-                                      len_in[6] = 0;
-                                      max_in[6] = buf_in[6] + real_sz[6];
-
-                                      for (ptr_in[6] = buf_in[6]; ptr_in[6] < max_in[6] && !end; ptr_in[6] += len_in[6] + 1)
-                                      {
-                                        main_ctx.cur_rep[6] = 0;
-
-                                        len_in[6] = get_line_len (ptr_in[6], max_in[6]);
-                                        vir_in[6] = len_in[6];
-
-                                        while (vir_in[6])
-                                        {
-                                          if (ptr_in[6][vir_in[6] - 1] != '\r') break;
-                                          vir_in[6]--;
-                                        }
-
-                                        if (vir_in[6] > WORD_MAX_LEN) continue;
-                                        if (maxLen_isSet && (vir_in[0]+vir_in[1]+vir_in[2]+vir_in[3]+vir_in[4]+vir_in[5]+vir_in[6]) > main_ctx.maxLen) continue;
-
-                                        // restore 7 if needed
-                                        main_ctx.off_vir_in[6] += vir_in[6];
-                                        if (restore_isSet && off_vir_in_init[6] >= 0 && main_ctx.off_vir_in[6] < off_vir_in_init[6]) continue;
-                                        off_vir_in_init[6] = -1;
-
-                                        if (maxRep_isSet)
-                                        {
-                                          if ((vir_in[6] == vir_in[5] && memcmp (ptr_in[6], ptr_in[5], vir_in[5]) == 0) ||
-                                              (vir_in[6] == vir_in[4] && memcmp (ptr_in[6], ptr_in[4], vir_in[4]) == 0) ||
-                                              (vir_in[6] == vir_in[3] && memcmp (ptr_in[6], ptr_in[3], vir_in[3]) == 0) ||
-                                              (vir_in[6] == vir_in[2] && memcmp (ptr_in[6], ptr_in[2], vir_in[2]) == 0) ||
-                                              (vir_in[6] == vir_in[1] && memcmp (ptr_in[6], ptr_in[1], vir_in[1]) == 0) ||
-                                              (vir_in[6] == vir_in[0] && memcmp (ptr_in[6], ptr_in[0], vir_in[0]) == 0))
-                                          {
-                                            ++main_ctx.cur_rep[6];
-                                            if ((main_ctx.cur_rep[0]+main_ctx.cur_rep[1]+main_ctx.cur_rep[2]+main_ctx.cur_rep[3]+main_ctx.cur_rep[4]+main_ctx.cur_rep[5]+main_ctx.cur_rep[6]) >= main_ctx.maxRep) continue;
-                                          }
-                                        }
-
-                                        if (buf_in[7])
-                                        {
-                                          while (!feof (main_ctx.fp[7]) && !end && !end2)
-                                          {
-                                            main_ctx.off_fd[7] = ftell (main_ctx.fp[7]);
-
-                                            real_sz[7] = read_segment (buf_in[7], main_ctx.fp[7]);
-                                            len_in[7] = 0;
-                                            max_in[7] = buf_in[7] + real_sz[7];
-
-                                            for (ptr_in[7] = buf_in[7]; ptr_in[7] < max_in[7] && !end; ptr_in[7] += len_in[7] + 1)
-                                            {
-                                              main_ctx.cur_rep[7] = 0;
-
-                                              len_in[7] = get_line_len (ptr_in[7], max_in[7]);
-                                              vir_in[7] = len_in[7];
-
-                                              while (vir_in[7])
-                                              {
-                                                if (ptr_in[7][vir_in[7] - 1] != '\r') break;
-                                                vir_in[7]--;
-                                              }
-
-                                              if (vir_in[7] > WORD_MAX_LEN) continue;
-                                              if (maxLen_isSet && (vir_in[0]+vir_in[1]+vir_in[2]+vir_in[3]+vir_in[4]+vir_in[5]+vir_in[6]+vir_in[7]) > main_ctx.maxLen) continue;
-
-                                              // restore 8 if needed
-                                              main_ctx.off_vir_in[7] += vir_in[7];
-                                              if (restore_isSet && off_vir_in_init[7] >= 0 && main_ctx.off_vir_in[7] < off_vir_in_init[7]) continue;
-                                              off_vir_in_init[7] = -1;
-
-                                              if (maxRep_isSet)
-                                              {
-                                                if ((vir_in[7] == vir_in[6] && memcmp (ptr_in[7], ptr_in[6], vir_in[6]) == 0) ||
-                                                    (vir_in[7] == vir_in[5] && memcmp (ptr_in[7], ptr_in[5], vir_in[5]) == 0) ||
-                                                    (vir_in[7] == vir_in[4] && memcmp (ptr_in[7], ptr_in[4], vir_in[4]) == 0) ||
-                                                    (vir_in[7] == vir_in[3] && memcmp (ptr_in[7], ptr_in[3], vir_in[3]) == 0) ||
-                                                    (vir_in[7] == vir_in[2] && memcmp (ptr_in[7], ptr_in[2], vir_in[2]) == 0) ||
-                                                    (vir_in[7] == vir_in[1] && memcmp (ptr_in[7], ptr_in[1], vir_in[1]) == 0) ||
-                                                    (vir_in[7] == vir_in[0] && memcmp (ptr_in[7], ptr_in[0], vir_in[0]) == 0))
-                                                {
-                                                  ++main_ctx.cur_rep[7];
-                                                  if ((main_ctx.cur_rep[0]+main_ctx.cur_rep[1]+main_ctx.cur_rep[2]+main_ctx.cur_rep[3]+main_ctx.cur_rep[4]+main_ctx.cur_rep[5]+main_ctx.cur_rep[6]+main_ctx.cur_rep[7]) >= main_ctx.maxRep)
-                                                  continue;
-                                                }
-                                              }
-
-                                              ADD_TO_OUTPUT_BUFFER(buf_out, ptr_out, ptr_in, vir_in, main_ctx.sepStart, main_ctx.sepStart_len, main_ctx.sep, main_ctx.sep_len, main_ctx.sepEnd, main_ctx.sepEnd_len)
-                                            }
-                                          }
-                                          rewind (main_ctx.fp[7]);
-
-                                          // reset cnt 8
-                                          main_ctx.off_vir_in[7] = 0;
-                                        }
-                                        else
-                                        {
-                                          ADD_TO_OUTPUT_BUFFER(buf_out, ptr_out, ptr_in, vir_in, main_ctx.sepStart, main_ctx.sepStart_len, main_ctx.sep, main_ctx.sep_len, main_ctx.sepEnd, main_ctx.sepEnd_len)
-                                        }
-                                      }
-                                    }
-                                    rewind (main_ctx.fp[6]);
-
-                                    // reset cnt 7
-                                    main_ctx.off_vir_in[6] = 0;
-                                  }
-                                  else
-                                  {
-                                    ADD_TO_OUTPUT_BUFFER(buf_out, ptr_out, ptr_in, vir_in, main_ctx.sepStart, main_ctx.sepStart_len, main_ctx.sep, main_ctx.sep_len, main_ctx.sepEnd, main_ctx.sepEnd_len)
-                                  }
-                                }
-                              }
-                              rewind (main_ctx.fp[5]);
-
-                              // reset cnt 6
-                              main_ctx.off_vir_in[5] = 0;
-                            }
-                            else
-                            {
-                              ADD_TO_OUTPUT_BUFFER(buf_out, ptr_out, ptr_in, vir_in, main_ctx.sepStart, main_ctx.sepStart_len, main_ctx.sep, main_ctx.sep_len, main_ctx.sepEnd, main_ctx.sepEnd_len)
-                            }
-                          }
-                        }
-                        rewind (main_ctx.fp[4]);
-
-                        // reset cnt 5
-                        main_ctx.off_vir_in[4] = 0;
-                      }
-                      else
-                      {
-                        ADD_TO_OUTPUT_BUFFER(buf_out, ptr_out, ptr_in, vir_in, main_ctx.sepStart, main_ctx.sepStart_len, main_ctx.sep, main_ctx.sep_len, main_ctx.sepEnd, main_ctx.sepEnd_len)
-                      }
-                    }
-                  }
-                  rewind (main_ctx.fp[3]);
-
-                  // reset cnt 4
-                  main_ctx.off_vir_in[3] = 0;
-                }
-                else
-                {
-                  ADD_TO_OUTPUT_BUFFER(buf_out, ptr_out, ptr_in, vir_in, main_ctx.sepStart, main_ctx.sepStart_len, main_ctx.sep, main_ctx.sep_len, main_ctx.sepEnd, main_ctx.sepEnd_len)
-                }
-              }
-            }
-            rewind (main_ctx.fp[2]);
-
-            // reset cnt 3
-            main_ctx.off_vir_in[2] = 0;
-          }
-          else
-          {
-            ADD_TO_OUTPUT_BUFFER(buf_out, ptr_out, ptr_in, vir_in, main_ctx.sepStart, main_ctx.sepStart_len, main_ctx.sep, main_ctx.sep_len, main_ctx.sepEnd, main_ctx.sepEnd_len)
-          }
-        }
-      }
-      rewind (main_ctx.fp[1]);
-
-      // reset cnt 3
-      main_ctx.off_vir_in[1] = 0;
-    }
-  }
-
+  // 4. Xử lý sau khi hoàn thành tổ hợp
   if (!end)
   {
     uint64_t len_out = (uint64_t) (ptr_out - buf_out);
 
-    fwrite (buf_out, 1, len_out, stdout);
-  }
-
-  if (!end && (session_isSet || restore_isSet))
-  {
-    int r = 0;
-
-    for (int i = 0; i < 7; i++) if (main_ctx.fp[i] && feof(main_ctx.fp[i])) r++;
-
-    if (r > 0)
+    if (len_out > 0)
     {
-      // reset first offset
-      main_ctx.off_vir_in[0] = 0;
+      fwrite (buf_out, 1, len_out, stdout);
+      fflush (stdout);
+    }
 
-      if (session_update() == false)
-      {
-        EXIT_WITH_RET(-1)
-      }
-
+    if (session_isSet || restore_isSet)
+    {
       session_destroy (true);
     }
   }
+  else
+  {
+    // Nếu người dùng nhấn Ctrl+C, tiến hành dump session vào file
+    if (session_isSet || restore_isSet) {
+      session_update();
+    }
+  }
 
-  EXIT_WITH_RET(0)
+  EXIT_WITH_RET(0);
 }
